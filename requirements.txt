@@ -1,5 +1,4 @@
-discord.py==2.3.2
+discord.py>=2.4.0
 aiohttp==3.9.1
 flask==3.0.0
 flask-cors==4.0.0
-audioop-37-whl
