@@ -4,7 +4,12 @@
 # ═══════════════════════════════════════════════════════════════
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-import json, os, datetime, threading, time, subprocess, sys
+import json, os, datetime, threading, time, subprocess, sys, logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -19,7 +24,19 @@ START_TIME  = datetime.datetime.utcnow()
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════
 def auth(req):
-    return req.headers.get("X-API-Key") == API_KEY
+    # Accept the API key from the X-API-Key header OR the request body
+    header_key = req.headers.get("X-API-Key", "")
+    body_key   = (req.get_json(silent=True) or {}).get("api_key", "")
+    provided   = header_key or body_key
+    if provided != API_KEY:
+        logging.warning(
+            "Auth failure — header key: %r, body key present: %s, remote: %s",
+            header_key or "(none)",
+            bool(body_key),
+            req.remote_addr,
+        )
+        return False
+    return True
 
 def lade(f, default={}):
     if not os.path.exists(f):
@@ -284,7 +301,7 @@ def selfcode_generate():
     if not gemini_key:
         return jsonify({"error": "Kein GEMINI_API_KEY"}), 500
 
-    import urllib.request, json as _json
+    import urllib.request, urllib.error, json as _json
     url     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
     system  = """Du bist ein Python-Code-Generator für einen discord.py 2.x Bot.
 Schreibe NUR den reinen Python-Funktionscode — keine Imports, kein if __name__, keine Erklärungen, keine Markdown-Backticks.
@@ -294,14 +311,30 @@ Nutze @bot.tree.command() für Slash-Commands. Kommentiere auf Deutsch. Max 60 Z
         "contents": [{"role": "user", "parts": [{"text": f"{system}\n\nSchreibe eine neue Discord-Bot-Funktion für: {aufgabe}"}]}],
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1000}
     }).encode()
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    gemini_req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(gemini_req, timeout=60) as resp:
             data = _json.loads(resp.read())
             code = data["candidates"][0]["content"]["parts"][0]["text"]
             code = code.replace("```python","").replace("```","").strip()
+    except TimeoutError:
+        logging.error("Gemini API timeout for task: %r", aufgabe)
+        return jsonify({"error": "Gemini API timeout — the request took longer than 60 seconds"}), 504
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        logging.error("Gemini API HTTP %s: %s", e.code, body)
+        if e.code in (400, 403):
+            return jsonify({"error": "Invalid Gemini API key or request rejected by Gemini", "detail": body}), 502
+        return jsonify({"error": f"Gemini API returned HTTP {e.code}", "detail": body}), 502
+    except urllib.error.URLError as e:
+        logging.error("Gemini API network error: %s", e.reason)
+        return jsonify({"error": f"Network error reaching Gemini API: {e.reason}"}), 502
+    except (KeyError, IndexError) as e:
+        logging.error("Unexpected Gemini response structure: %s", e)
+        return jsonify({"error": "Unexpected response structure from Gemini API"}), 502
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logging.exception("Unhandled error during Gemini API call")
+        return jsonify({"error": f"Internal error: {e}"}), 500
 
     cl = lade(CODELOG, {"extensions": [], "total_written": 0})
     cl["total_written"] += 1
