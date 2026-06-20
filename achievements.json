@@ -1,0 +1,11 @@
+{
+    "unlocked": {},
+    "definitions": {
+        "first_message": {"name": "👋 Erste Schritte", "desc": "Erste Nachricht gesendet"},
+        "level_10": {"name": "⭐ Aufsteiger", "desc": "Level 10 erreicht"},
+        "level_25": {"name": "🌟 Veteran", "desc": "Level 25 erreicht"},
+        "rich_10k": {"name": "💰 Wohlhabend", "desc": "10.000 Coins gesammelt"},
+        "ki_chatter": {"name": "🧠 KI-Freund", "desc": "50 mal mit der KI gechattet"},
+        "giveaway_win": {"name": "🎉 Glückspilz", "desc": "Ein Giveaway gewonnen"}
+    }
+}

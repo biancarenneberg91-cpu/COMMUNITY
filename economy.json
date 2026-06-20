@@ -1,0 +1,9 @@
+{
+    "balances": {},
+    "daily_claimed": {},
+    "shop_items": {
+        "vip_rolle": {"preis": 5000, "name": "🌟 VIP Rolle"},
+        "custom_color": {"preis": 2500, "name": "🎨 Eigene Farbe"},
+        "boost_xp": {"preis": 1000, "name": "⚡ 2x XP für 1 Tag"}
+    }
+}
