@@ -128,6 +128,12 @@ def lade_daten():
         "modmail_team_rolle": None,         # Rollen-Name mit Zugriff auf ModMail-Kanäle
         "modmail_aktive_threads": {},       # {nutzer_id: kanal_id} — wer hat gerade einen offenen ModMail-Thread
         "modmail_trigger_wort": "modmail",  # Schlüsselwort, das in der DM einen ModMail-Thread eröffnet
+        # ── v22: On-Duty System — Mod/Supporter Verfügbarkeitsanzeige ──
+        "onduty_team_rolle": None,          # Rollen-Name, die berechtigt ist sich on-duty zu melden
+        "onduty_aktive": {},                 # {uid: {"seit": iso_zeit, "name": str}}
+        "onduty_status_kanal": None,         # Kanal-ID, in dem die Live-Übersicht gepflegt wird
+        "onduty_status_nachricht_id": None,  # Message-ID der Status-Übersicht (wird laufend aktualisiert statt neu gepostet)
+        "onduty_log_kanal": None,            # Optionaler Log-Kanal für An-/Abmeldungen
     }
     return _robust_json_lesen(DATA_FILE, default)
 
@@ -728,6 +734,14 @@ async def on_member_remove(member):
         log_embed.add_field(name="War Mitglied seit", value=member.joined_at.strftime("%d.%m.%Y"))
     await log_event(member.guild, "leave", log_embed)
 
+    # On-Duty-Status automatisch entfernen, falls die Person den Server verlässt,
+    # während sie als "im Dienst" gemeldet war — sonst bleibt der Status ewig stehen.
+    uid = str(member.id)
+    if uid in daten.get("onduty_aktive", {}):
+        del daten["onduty_aktive"][uid]
+        speichere_daten(daten)
+        await onduty_status_aktualisieren(member.guild)
+
 # ═══════════════════════════════════════════════════════════════
 #  ANTI-NUKE — Schutz gegen Massen-Löschung durch kompromittierte
 #  Mod-Accounts. Trackt destruktive Aktionen pro Person via Audit-Log
@@ -799,6 +813,49 @@ async def modmail_an_nutzer_weiterleiten(kanal_id: str, autor: discord.Member, i
     except Exception as e:
         print(f"[ModMail] Konnte Antwort nicht an Nutzer senden: {e}")
         return False
+
+# ═══════════════════════════════════════════════════════════════
+#  ON-DUTY SYSTEM — Live-Übersicht wer aktuell als Mod/Supporter
+#  verfügbar ist. Editiert EINE Nachricht laufend, statt den Kanal
+#  mit ständig neuen Status-Posts zu überfluten.
+# ═══════════════════════════════════════════════════════════════
+async def onduty_status_aktualisieren(guild: discord.Guild):
+    daten = lade_daten()
+    kanal_id = daten.get("onduty_status_kanal")
+    if not kanal_id:
+        return
+    kanal = guild.get_channel(int(kanal_id))
+    if not kanal:
+        return
+
+    aktive = daten.get("onduty_aktive", {})
+    embed = discord.Embed(title="🟢 Aktuell im Dienst", color=0x00ff88 if aktive else 0x808080, timestamp=datetime.datetime.utcnow())
+    if not aktive:
+        embed.description = "Aktuell ist niemand im Dienst."
+    else:
+        zeilen = []
+        for uid, info in aktive.items():
+            seit = datetime.datetime.fromisoformat(info["seit"])
+            dauer_min = int((datetime.datetime.utcnow() - seit).total_seconds() // 60)
+            zeilen.append(f"🟢 <@{uid}> — seit {dauer_min} Min.")
+        embed.description = "\n".join(zeilen)
+    embed.set_footer(text="Wird automatisch aktualisiert")
+
+    nachricht_id = daten.get("onduty_status_nachricht_id")
+    if nachricht_id:
+        try:
+            nachricht = await kanal.fetch_message(int(nachricht_id))
+            await nachricht.edit(embed=embed)
+            return
+        except (discord.NotFound, discord.HTTPException):
+            pass  # Nachricht wurde gelöscht oder ist ungültig — neue erstellen
+
+    try:
+        neue_nachricht = await kanal.send(embed=embed)
+        daten["onduty_status_nachricht_id"] = str(neue_nachricht.id)
+        speichere_daten(daten)
+    except Exception as e:
+        print(f"[On-Duty] Konnte Status-Nachricht nicht erstellen: {e}")
 
 async def pruefe_antinuke(guild: discord.Guild, audit_action, aktions_name: str):
     daten = lade_daten()
@@ -1691,6 +1748,108 @@ async def modmail_liste(interaction: discord.Interaction):
     for nutzer_id, kanal_id in aktive_threads.items():
         embed.add_field(name=f"<@{nutzer_id}>", value=f"<#{kanal_id}>", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ═══════════════════════════════════════════════════════════════
+#  ON-DUTY SYSTEM — Slash-Commands
+# ═══════════════════════════════════════════════════════════════
+def hat_onduty_berechtigung(member: discord.Member, daten: dict) -> bool:
+    if ist_owner(member.id):
+        return True
+    rollen_name = daten.get("onduty_team_rolle")
+    if not rollen_name:
+        return False
+    return any(r.name == rollen_name for r in member.roles)
+
+@bot.tree.command(name="onduty", description="Dich als im Dienst melden (für Mod/Supporter-Team)")
+async def onduty(interaction: discord.Interaction):
+    daten = lade_daten()
+    if not hat_onduty_berechtigung(interaction.user, daten):
+        await interaction.response.send_message("❌ Du hast keine Berechtigung dafür — frag einen Owner nach der Team-Rolle.", ephemeral=True)
+        return
+
+    uid = str(interaction.user.id)
+    daten.setdefault("onduty_aktive", {})
+    if uid in daten["onduty_aktive"]:
+        await interaction.response.send_message("Du bist schon im Dienst gemeldet.", ephemeral=True)
+        return
+
+    daten["onduty_aktive"][uid] = {"seit": str(datetime.datetime.utcnow()), "name": interaction.user.display_name}
+    speichere_daten(daten)
+    await onduty_status_aktualisieren(interaction.guild)
+
+    log_kanal_id = daten.get("onduty_log_kanal")
+    if log_kanal_id:
+        kanal = interaction.guild.get_channel(int(log_kanal_id))
+        if kanal:
+            try:
+                await kanal.send(f"🟢 {interaction.user.mention} hat sich **im Dienst** gemeldet.")
+            except Exception as e:
+                print(f"[On-Duty] Log-Fehler: {e}")
+
+    await interaction.response.send_message("✅ Du bist jetzt **im Dienst** gemeldet.", ephemeral=True)
+
+@bot.tree.command(name="offduty", description="Dich als außer Dienst melden")
+async def offduty(interaction: discord.Interaction):
+    daten = lade_daten()
+    uid = str(interaction.user.id)
+    aktive = daten.get("onduty_aktive", {})
+
+    if uid not in aktive:
+        await interaction.response.send_message("Du bist aktuell nicht im Dienst gemeldet.", ephemeral=True)
+        return
+
+    seit = datetime.datetime.fromisoformat(aktive[uid]["seit"])
+    dauer_min = int((datetime.datetime.utcnow() - seit).total_seconds() // 60)
+    del daten["onduty_aktive"][uid]
+    speichere_daten(daten)
+    await onduty_status_aktualisieren(interaction.guild)
+
+    log_kanal_id = daten.get("onduty_log_kanal")
+    if log_kanal_id:
+        kanal = interaction.guild.get_channel(int(log_kanal_id))
+        if kanal:
+            try:
+                await kanal.send(f"🔴 {interaction.user.mention} hat sich **außer Dienst** gemeldet (Dauer: {dauer_min} Min.)")
+            except Exception as e:
+                print(f"[On-Duty] Log-Fehler: {e}")
+
+    await interaction.response.send_message(f"✅ Außer Dienst gemeldet. Dauer: **{dauer_min} Minuten**.", ephemeral=True)
+
+@bot.tree.command(name="onduty-liste", description="Wer ist aktuell im Dienst?")
+async def onduty_liste(interaction: discord.Interaction):
+    daten = lade_daten()
+    aktive = daten.get("onduty_aktive", {})
+    if not aktive:
+        await interaction.response.send_message("Aktuell ist niemand im Dienst.", ephemeral=True)
+        return
+    embed = discord.Embed(title="🟢 Aktuell im Dienst", color=0x00ff88)
+    for uid, info in aktive.items():
+        seit = datetime.datetime.fromisoformat(info["seit"])
+        dauer_min = int((datetime.datetime.utcnow() - seit).total_seconds() // 60)
+        embed.add_field(name=f"<@{uid}>", value=f"seit {dauer_min} Min.", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="setup-onduty", description="[OWNER] On-Duty-System einrichten: Team-Rolle + Status-Kanal")
+@owner_only()
+async def setup_onduty(interaction: discord.Interaction, team_rolle: discord.Role, status_kanal: discord.TextChannel, log_kanal: discord.TextChannel = None):
+    daten = lade_daten()
+    daten["onduty_team_rolle"] = team_rolle.name
+    daten["onduty_status_kanal"] = str(status_kanal.id)
+    daten["onduty_status_nachricht_id"] = None  # Neue Status-Nachricht im neuen Kanal erzwingen
+    if log_kanal:
+        daten["onduty_log_kanal"] = str(log_kanal.id)
+    speichere_daten(daten)
+
+    await onduty_status_aktualisieren(interaction.guild)
+
+    await interaction.response.send_message(
+        f"✅ On-Duty-System eingerichtet!\n"
+        f"**Team-Rolle:** {team_rolle.mention}\n"
+        f"**Status-Kanal:** {status_kanal.mention}\n"
+        f"{f'**Log-Kanal:** {log_kanal.mention}' if log_kanal else ''}\n\n"
+        f"Team-Mitglieder nutzen `/onduty` und `/offduty` zum An-/Abmelden.",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="log-event-umschalten", description="[OWNER] Einen Log-Event-Typ an/aus schalten")
 @owner_only()
@@ -3090,6 +3249,7 @@ async def hilfe(interaction: discord.Interaction):
     embed.add_field(name="🛡️ Moderation", value="`/warn` `/warnings` `/kick` `/ban` `/timeout`", inline=False)
     embed.add_field(name="🚨 Security", value="`/security-status` *(Owner)*\nAnti-Raid & Anti-Nuke: `/antiraid-an` `/antinuke-an` *(Owner)*", inline=False)
     embed.add_field(name="📬 ModMail", value="Schreib dem Bot eine DM beginnend mit **modmail** für direkten Team-Kontakt\nVerwaltung: `/setup-modmail` `/modmail-liste` *(Owner)*", inline=False)
+    embed.add_field(name="🟢 On-Duty", value="`/onduty` `/offduty` `/onduty-liste` *(Team)*\nSetup: `/setup-onduty` *(Owner)*", inline=False)
     embed.add_field(name="🔧 Custom Commands & Trigger", value="`/custom-commands-liste` `/trigger-liste` (Verwaltung: Owner-Bereich)", inline=False)
     embed.add_field(name="🎫 KI-Tickets", value="`/ticket [beschreibung]` oder Dropdown-Panel nutzen\n🔒 🆘 🧠 Buttons direkt im Ticket — kein Befehl nötig\n`/bewerbung-notiz` `/bewerbung-notizen-anzeigen` *(Supporter)*", inline=False)
     embed.add_field(name="🎮 Fun", value="`/münzwurf` `/würfeln` `/8ball` `/roast`", inline=False)
